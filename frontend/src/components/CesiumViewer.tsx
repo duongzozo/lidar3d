@@ -149,18 +149,18 @@ class TilesetManager {
         "tileset.json"
       );
       const tileset = await Cesium3DTileset.fromUrl(tilesetUrl, {
-        // Octree LOD from backend writer - lower SSE loads finer tiles sooner.
-        maximumScreenSpaceError: 4,
+        // Octree LOD from py3dtiles — let Cesium pick the right level
+        maximumScreenSpaceError: 8,           // lower = more detail
         cacheBytes: 1024 * 1024 * 1024,       // 1 GB tile cache for smooth pan
         maximumCacheOverflowBytes: 512 * 1024 * 1024,
-        skipLevelOfDetail: false,
-        skipScreenSpaceErrorFactor: 8,
+        skipLevelOfDetail: true,              // skip intermediate LODs for speed
+        skipScreenSpaceErrorFactor: 16,
         baseScreenSpaceError: 1024,
-        skipLevels: 0,
+        skipLevels: 1,
         immediatelyLoadDesiredLevelOfDetail: false,
         loadSiblings: true,                   // smoother pan/zoom
         cullWithChildrenBounds: true,
-        dynamicScreenSpaceError: false,
+        dynamicScreenSpaceError: true,        // adapt LOD based on camera speed
         dynamicScreenSpaceErrorDensity: 0.00278,
         dynamicScreenSpaceErrorFactor: 4.0,
         preloadWhenHidden: true,
@@ -408,14 +408,6 @@ const CesiumViewer = forwardRef<ViewerHandle, CesiumViewerProps>(
 
     useEffect(() => {
       if (!isReady || !tilesetMgrRef.current) return;
-
-      const activeDatasetIds = new Set(datasets.map((layer) => layer.id));
-      for (const id of Array.from(loadedLayersRef.current)) {
-        if (!activeDatasetIds.has(id)) {
-          tilesetMgrRef.current.remove(id);
-          loadedLayersRef.current.delete(id);
-        }
-      }
 
       for (const layer of datasets) {
         if (layer.status !== "completed") continue;
