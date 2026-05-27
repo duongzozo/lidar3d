@@ -293,15 +293,42 @@ async def reprocess_dataset(
     if not ds.file_path:
         raise HTTPException(status_code=400, detail="No source file on record")
 
-    input_path = ds.file_path
-    output_dir = str(settings.OUTPUT_DIR / str(dataset_id))
+    # Smart input file resolution:
+    # 1. If original file exists, use it (full reprocess with CRS reprojection)
+    # 2. If only reprojected.laz exists, use it (regenerate LOD tiles only)
+    from pathlib import Path as _Path
+    dataset_dir = settings.OUTPUT_DIR / str(dataset_id)
+    candidates = [
+        _Path(ds.file_path) if ds.file_path else None,
+        dataset_dir / ds.original_filename if ds.original_filename else None,
+        dataset_dir / "reprojected.laz",
+    ]
+    input_path = None
+    for c in candidates:
+        if c and c.exists():
+            input_path = str(c)
+            log.info("reprocess_input_resolved", path=input_path)
+            break
 
-    # Clean previous output
-    potree_dir = settings.OUTPUT_DIR / str(dataset_id) / "potree"
+    if not input_path:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Original file not found. Expected at: {ds.file_path or 'unknown'}. "
+                   f"Please re-upload the dataset.",
+        )
+
+    output_dir = str(dataset_dir)
+
+    # Only clean LOD output, KEEP source files
+    potree_dir = dataset_dir / "potree"
     if potree_dir.exists():
         shutil.rmtree(potree_dir, ignore_errors=True)
-    reprojected = settings.OUTPUT_DIR / str(dataset_id) / "reprojected.laz"
-    reprojected.unlink(missing_ok=True)
+    downsampled = dataset_dir / "downsampled.laz"
+    downsampled.unlink(missing_ok=True)
+
+    # Only delete reprojected.laz if we have the original (will regen)
+    if _Path(input_path) != dataset_dir / "reprojected.laz":
+        (dataset_dir / "reprojected.laz").unlink(missing_ok=True)
 
     # New processing job
     job = ProcessingJob(dataset_id=dataset_id, job_type="reprocess")

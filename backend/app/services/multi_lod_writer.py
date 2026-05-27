@@ -1,14 +1,13 @@
 """
 Multi-level LOD 3D Tiles generator — pure Python, no multiprocessing.
 
-Strategy: octree spatial decomposition. Each level subsamples points so:
-  Level 0 (root):     ~50k points covering full bbox        — visible from far
-  Level 1 (8 tiles):  ~80k points each (8 octants)          — medium zoom
-  Level 2 (≤64 tiles): ~50k points each (only dense ones)    — close zoom
+Strategy: recursive octree spatial decomposition. Internal nodes contain a
+sampled overview for fast distant rendering, while leaf nodes contain every
+point from the uploaded LAS/LAZ file.
 
-Cesium 3D Tiles spec: at each level, refine="ADD" means children render
-ON TOP of parent (cumulative detail). Result: smooth zoom from overview
-to full density, just like desktop point cloud viewers.
+Cesium 3D Tiles spec: refine="REPLACE" means finer child tiles replace the
+coarser parent tile, matching map-style LOD and avoiding duplicate points.
+Result: smooth zoom from overview to full density.
 
 Output structure matches py3dtiles / PotreeConverter:
   potree/
@@ -95,6 +94,13 @@ def _write_pnts(
     return rtc, float(d.max()) * 1.05
 
 
+def _bounding_sphere(cx: np.ndarray, cy: np.ndarray, cz: np.ndarray) -> tuple[list[float], float]:
+    """Return a conservative sphere for all points in a tile subtree."""
+    center = [float(cx.mean()), float(cy.mean()), float(cz.mean())]
+    d = np.sqrt((cx - center[0])**2 + (cy - center[1])**2 + (cz - center[2])**2)
+    return center, float(d.max()) * 1.05
+
+
 def _octant_split(cx, cy, cz, r, g, b):
     """Split points into 8 octants based on bbox midpoints. Returns list of 8 arrays-tuples."""
     mx, my, mz = (cx.min() + cx.max()) / 2, (cy.min() + cy.max()) / 2, (cz.min() + cz.max()) / 2
@@ -121,10 +127,17 @@ def _sample(arrays: tuple, n_max: int, rng):
     return tuple(a[idx] for a in arrays)
 
 
+def _geometric_error(radius: float, depth: int, is_leaf: bool) -> float:
+    """Approximate tile error in meters for Cesium screen-space LOD selection."""
+    if is_leaf:
+        return 0.0
+    return max(radius / (8 * (2 ** depth)), 1.0)
+
+
 def generate_multi_lod_tileset(
     las_path: Path,
     output_dir: Path,
-    max_total_points: int = 2_000_000,
+    max_total_points: Optional[int] = None,
 ) -> bool:
     """Generate Cesium 3D Tiles with proper octree LOD using pure Python."""
     try:
@@ -150,9 +163,10 @@ def generate_multi_lod_tileset(
             log.error("multi_lod_not_wgs84")
             return False
 
-        # Downsample globally if huge (input cap)
+        # Optional safety cap. Keep None to preserve every uploaded point in
+        # the final leaf tiles.
         rng = np.random.default_rng(42)
-        if n_total > max_total_points:
+        if max_total_points is not None and n_total > max_total_points:
             idx = rng.choice(n_total, max_total_points, replace=False)
             idx.sort()
             lon, lat, alt = lon[idx], lat[idx], alt[idx]
@@ -177,69 +191,63 @@ def generate_multi_lod_tileset(
         n_used = len(cx)
         log.info("multi_lod_loaded", points=n_used)
 
-        # ── Build octree LOD ────────────────────────────────────────
-        # Level 0: root with subsampled overview
-        L0_PTS, L1_PTS, L2_PTS = 80_000, 100_000, 80_000
+        # ── Build recursive octree LOD ──────────────────────────────
+        # Internal nodes are small previews; leaves are never sampled so the
+        # finest LOD contains all points from the uploaded file.
+        INTERNAL_PREVIEW_POINTS = 60_000
+        LEAF_MAX_POINTS = 120_000
+        MIN_SPLIT_POINTS = LEAF_MAX_POINTS + 1
+        MAX_DEPTH = 10
 
-        root_data = _sample((cx, cy, cz, r, g, b), L0_PTS, rng)
-        root_rtc, root_sphere_r = _write_pnts(potree_dir / "r.pnts", *root_data)
-        log.info("multi_lod_l0_written", points=len(root_data[0]))
-
-        # Level 1: 8 octants
-        l1_tiles = []
-        octants_l1 = _octant_split(cx, cy, cz, r, g, b)
-        for i, oct_data in enumerate(octants_l1):
-            if oct_data is None or len(oct_data[0]) < 1000:
-                continue
-            sampled = _sample(oct_data, L1_PTS, rng)
-            tile_name = f"r{i}.pnts"
-            rtc, sphere_r = _write_pnts(potree_dir / tile_name, *sampled)
-
+        def build_node(name: str, arrays: tuple, depth: int) -> dict:
+            n_points = len(arrays[0])
+            should_split = n_points >= MIN_SPLIT_POINTS and depth < MAX_DEPTH
             children = []
-            # Level 2: subdivide if still dense
-            if len(oct_data[0]) > L1_PTS * 1.5:
-                sub_octants = _octant_split(*oct_data)
-                for j, sub in enumerate(sub_octants):
-                    if sub is None or len(sub[0]) < 500:
+
+            if should_split:
+                for i, child_arrays in enumerate(_octant_split(*arrays)):
+                    if child_arrays is None:
                         continue
-                    sub_sampled = _sample(sub, L2_PTS, rng)
-                    sub_name = f"r{i}{j}.pnts"
-                    sub_rtc, sub_sphere_r = _write_pnts(
-                        potree_dir / sub_name, *sub_sampled
-                    )
-                    children.append({
-                        "boundingVolume": {"sphere": sub_rtc + [sub_sphere_r]},
-                        "geometricError": 5.0,
-                        "refine": "ADD",
-                        "content": {"uri": sub_name},
-                    })
+                    children.append(build_node(f"{name}{i}", child_arrays, depth + 1))
 
-            l1_tiles.append({
-                "boundingVolume": {"sphere": rtc + [sphere_r]},
-                "geometricError": 30.0,
-                "refine": "ADD",
+            is_leaf = not children
+            write_arrays = arrays if is_leaf else _sample(arrays, INTERNAL_PREVIEW_POINTS, rng)
+            tile_name = f"{name}.pnts"
+            _write_pnts(potree_dir / tile_name, *write_arrays)
+
+            sphere_center, sphere_r = _bounding_sphere(arrays[0], arrays[1], arrays[2])
+            tile = {
+                "boundingVolume": {"sphere": sphere_center + [sphere_r]},
+                "geometricError": _geometric_error(sphere_r, depth, is_leaf),
+                "refine": "REPLACE",
                 "content": {"uri": tile_name},
-                "children": children,
-            })
+            }
+            if children:
+                tile["children"] = children
 
-        log.info("multi_lod_l1_written", n_tiles=len(l1_tiles))
+            log.info(
+                "multi_lod_node_written",
+                tile=name,
+                depth=depth,
+                source_points=n_points,
+                written_points=len(write_arrays[0]),
+                children=len(children),
+                leaf=is_leaf,
+            )
+            return tile
+
+        root_tile = build_node("r", (cx, cy, cz, r, g, b), 0)
 
         # ── Build tileset.json ──────────────────────────────────────
         tileset = {
             "asset": {"version": "1.0"},
-            "geometricError": 1000.0,
-            "root": {
-                "boundingVolume": {"sphere": root_rtc + [root_sphere_r]},
-                "geometricError": 100.0,
-                "refine": "ADD",
-                "content": {"uri": "r.pnts"},
-                "children": l1_tiles,
-            },
+            "geometricError": max(root_tile["geometricError"], 1.0),
+            "root": root_tile,
         }
         (potree_dir / "tileset.json").write_text(json.dumps(tileset, indent=2))
 
         n_tiles = len(list(potree_dir.glob("*.pnts")))
-        log.info("multi_lod_done", n_tiles=n_tiles, l1_count=len(l1_tiles))
+        log.info("multi_lod_done", n_tiles=n_tiles)
         return True
 
     except Exception as exc:
