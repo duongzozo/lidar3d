@@ -1,0 +1,169 @@
+services:
+  # ── PostgreSQL + PostGIS ──────────────────────────────────────────
+  postgres:
+    image: postgis/postgis:15-3.3
+    container_name: lidar3d_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lidar3d
+      POSTGRES_USER: lidar3d
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-lidar3d_secret}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infra/scripts/init_db.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lidar3d"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Redis ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: lidar3d_redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ── FastAPI Backend ───────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: lidar3d_backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://lidar3d:${POSTGRES_PASSWORD:-lidar3d_secret}@postgres:5432/lidar3d
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      UPLOAD_DIR: /data/uploads
+      OUTPUT_DIR: /data/output
+    volumes:
+      - lidar_data:/data
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 4 --loop asyncio
+
+  # ── Celery Worker ─────────────────────────────────────────────────
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: lidar3d_celery
+    restart: unless-stopped
+    shm_size: 2gb       # py3dtiles multiprocessing needs shared memory > 64MB default
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://lidar3d:${POSTGRES_PASSWORD:-lidar3d_secret}@postgres:5432/lidar3d
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      UPLOAD_DIR: /data/uploads
+      OUTPUT_DIR: /data/output
+    volumes:
+      - lidar_data:/data
+      - ./backend:/app
+    depends_on:
+      - postgres
+      - redis
+    command: >
+      celery -A app.workers.celery_app worker
+        --loglevel=info
+        --pool=solo
+        --queues=lidar_processing,default
+        --max-tasks-per-child=10
+        --time-limit=7200
+        --soft-time-limit=6600
+
+  # ── Celery Beat (scheduler) ───────────────────────────────────────
+  celery_beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: lidar3d_beat
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://lidar3d:${POSTGRES_PASSWORD:-lidar3d_secret}@postgres:5432/lidar3d
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+    volumes:
+      - lidar_data:/data
+      - ./backend:/app
+    depends_on:
+      - redis
+    command: celery -A app.workers.celery_app beat --loglevel=info
+
+  # ── Flower (Celery monitor) ───────────────────────────────────────
+  flower:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: lidar3d_flower
+    restart: unless-stopped
+    environment:
+      CELERY_BROKER_URL: redis://redis:6379/1
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+    command: celery -A app.workers.celery_app flower --port=5555 --basic_auth=${FLOWER_USER:-admin}:${FLOWER_PASSWORD:-admin}
+
+  # ── React Frontend ────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        VITE_API_URL: ${VITE_API_URL:-}
+        VITE_WS_URL: ${VITE_WS_URL:-}
+        VITE_CESIUM_TOKEN: ${CESIUM_ION_TOKEN:-}
+    container_name: lidar3d_frontend
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+
+  # ── Nginx Reverse Proxy ───────────────────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: lidar3d_nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./infra/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infra/nginx/ssl:/etc/nginx/ssl:ro
+      - lidar_data:/data:ro
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  postgres_data:
+  redis_data:
+  lidar_data:
+
+networks:
+  default:
+    name: lidar3d_net

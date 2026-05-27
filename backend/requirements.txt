@@ -1,0 +1,52 @@
+# ── FastAPI Core ──────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+websockets==12.0
+httpx==0.27.0
+
+# ── Database ──────────────────────────────────────────────────────
+sqlalchemy[asyncio]==2.0.30
+asyncpg==0.29.0
+alembic==1.13.1
+geoalchemy2==0.15.1
+# self-contained binary wheel — no libpq-dev needed
+psycopg2-binary==2.9.9
+
+# ── Redis / Celery ────────────────────────────────────────────────
+redis[hiredis]==5.0.4
+celery[redis]==5.4.0
+flower==2.0.1
+
+# ── Auth ─────────────────────────────────────────────────────────
+python-jose[cryptography]==3.3.0
+# passlib 1.7.4 incompatible with bcrypt>=4.x — use bcrypt directly
+bcrypt==4.2.1
+python-dotenv==1.0.1
+
+# ── Geospatial — all manylinux wheels, self-contained ────────────
+# pyproj: bundles PROJ native lib
+pyproj==3.6.1
+# shapely: bundles GEOS native lib
+shapely==2.0.4
+numpy==1.26.4
+# laspy[lazrs]: pure Python + Rust LAZ decoder, no native deps
+laspy[lazrs]==2.5.4
+# py3dtiles: pure Python 3D Tiles generator with LOD (replaces PotreeConverter)
+py3dtiles==12.1.1
+
+# ── File handling ────────────────────────────────────────────────
+aiofiles==23.2.1
+
+# ── Validation ───────────────────────────────────────────────────
+pydantic==2.7.1
+pydantic-settings==2.2.1
+email-validator==2.1.1
+
+# ── Monitoring / Logging ─────────────────────────────────────────
+structlog==24.1.0
+sentry-sdk[fastapi]==2.1.1
+
+# ── Testing ──────────────────────────────────────────────────────
+pytest==8.2.0
+pytest-asyncio==0.23.6
